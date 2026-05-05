@@ -1,0 +1,1164 @@
+---
+title: "Bikesharing Dataset"
+author: "Geethika Satheesh & Venkata Satya Sreeya Ch"
+date: "`r Sys.Date()`"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r Packages Installation}
+suppressWarnings(
+  suppressPackageStartupMessages({
+library(dplyr)
+library(lubridate)
+library(tidyverse)
+library(skimr)
+library(janitor)
+library(corrplot)
+library (ggplot2)
+library(forecast)
+library(zoo)
+library(TTR)
+library(gridExtra)
+library(scales)
+library(tseries)
+library(forecast)
+library(prophet)
+  })
+)
+```
+
+## Load Data
+
+```{r}
+day_data <- read.csv("day.csv")
+hour_data <- read.csv("hour.csv")
+
+#shape of data
+dim(day_data)
+dim(hour_data)
+
+#structure of data
+glimpse(day_data)
+glimpse(hour_data)
+
+#summary of data
+summary(day_data)
+summary(hour_data)
+
+```
+
+
+```{r}
+head(day_data)
+head(hour_data)
+tail(day_data)
+tail(hour_data)
+```
+
+##Data Cleaning 
+
+```{r}
+# ── STEP 1: Check NA values (on raw data - perfectly fine here) ──
+colSums(is.na(day_data))
+colSums(is.na(hour_data))
+
+# Check blank empty cells
+sapply(day_data[, sapply(day_data, is.character)], 
+       function(x) sum(x == "", na.rm = TRUE))
+sapply(hour_data[, sapply(hour_data, is.character)], 
+       function(x) sum(x == "", na.rm = TRUE))
+
+# ── STEP 2: Convert date columns ──
+day_data$dteday  <- as.Date(day_data$dteday,  format = "%m/%d/%Y")
+hour_data$dteday <- as.Date(hour_data$dteday, format = "%m/%d/%Y")
+
+#Full timestamp - completely unambiguous for R
+hour_data$datetime <- as.POSIXct(
+  sprintf("%s %02d:00:00", 
+          as.character(hour_data$dteday), 
+          as.integer(hour_data$hr)),
+  format = "%Y-%m-%d %H:%M:%S"
+)
+
+# ── STEP 3: Verify ──
+str(day_data$dteday)     # Should show: Date[1:731]
+str(hour_data$datetime)  # Should show: POSIXct[1:17379]
+head(hour_data$datetime) # Preview first few timestamps
+
+all_days      <- seq(min(day_data$dteday), 
+                     max(day_data$dteday), by = "day")
+missing_days  <- setdiff(all_days, day_data$dteday)
+
+all_hours     <- seq(min(hour_data$datetime), 
+                     max(hour_data$datetime), by = "hour")
+missing_hours <- setdiff(all_hours, hour_data$datetime)
+
+cat("Missing days :", length(missing_days),  "\n")
+cat("Missing hours:", length(missing_hours), "\n")
+
+# ── Inspect Missing Hours ──
+missing_df <- data.frame(
+  hour  = as.integer(format(as.POSIXct(missing_hours, origin="1970-01-01"), "%H")),
+  date  = as.Date(as.POSIXct(missing_hours, origin="1970-01-01")),
+  month = as.integer(format(as.POSIXct(missing_hours, origin="1970-01-01"), "%m"))
+)
+
+print(table(missing_df$hour))   # Missing by hour
+print(table(missing_df$month))  # Missing by month
+print(sort(table(missing_df$date), decreasing=TRUE)[1:20]) # Top dates
+
+
+#handling missing values
+# Confirm: 2011-01-27 had 22/24 hours missing = full system shutdown
+# Confirm: 2012-10-29 & 10-30 = Hurricane Sandy documented event
+
+# DECISION: Use Linear Interpolation
+# Reason: Missing hours are during extreme weather when
+# rentals would naturally be near 0 anyway
+
+full_grid <- data.frame(
+  datetime = seq(min(hour_data$datetime),
+                 max(hour_data$datetime),
+                 by = "hour")
+)
+
+hour_complete <- merge(full_grid, hour_data,
+                       by = "datetime", all.x = TRUE)
+
+# Interpolate all key numeric columns
+cols_to_fix <- c("cnt","casual","registered",
+                 "temp","atemp","hum","windspeed")
+
+hour_complete[cols_to_fix] <- lapply(
+  hour_complete[cols_to_fix], 
+  na.approx, na.rm = FALSE
+)
+
+hour_complete <- hour_complete[!is.na(hour_complete$hr), ]
+# Verify
+cat("Rows after completion:", nrow(hour_complete), "\n") # 17544
+cat("Remaining NAs in cnt:", sum(is.na(hour_complete$cnt)), "\n") # 0
+```
+
+##Outlier detection
+
+```{r}
+# Daily data - key numeric columns
+par(mfrow = c(2, 3))
+boxplot(day_data$cnt,       main = "Total Rentals (cnt)",  col = "steelblue")
+boxplot(day_data$casual,    main = "Casual Users",          col = "tomato")
+boxplot(day_data$registered,main = "Registered Users",      col = "seagreen")
+boxplot(day_data$temp,      main = "Temperature",           col = "orange")
+boxplot(day_data$hum,       main = "Humidity",              col = "purple")
+boxplot(day_data$windspeed, main = "Wind Speed",            col = "pink")
+
+#STEP 9: IQR-based outlier count
+detect_outliers <- function(x) {
+  Q1  <- quantile(x, 0.25, na.rm = TRUE)
+  Q3  <- quantile(x, 0.75, na.rm = TRUE)
+  IQR <- Q3 - Q1
+  sum(x < (Q1 - 1.5 * IQR) | x > (Q3 + 1.5 * IQR), na.rm = TRUE)
+}
+
+# Apply to all numeric columns in day_data
+num_cols <- sapply(day_data, is.numeric)
+outlier_counts <- sapply(day_data[, num_cols], detect_outliers)
+print(outlier_counts)
+
+```
+
+
+```{r}
+# Likely sensor errors (humidity near 0 is physically impossible)
+day_data$hum[day_data$hum < 0.1] <- median(day_data$hum)
+# Verify 
+boxplot(day_data$hum, main = "Humidity After Fix", col = "purple")
+min(day_data$hum)  # Should no longer be near 0
+
+# ── Create cleaned copy ──
+day_clean <- day_data
+
+# ── Define event dates ──
+event_dates <- as.Date(c(
+  "2012-10-29",  # Hurricane Sandy Day 1
+  "2012-10-30",  # Hurricane Sandy Day 2
+  "2011-01-27",  # Winter Storm (22/24 hours missing)
+  "2011-01-18",  # Winter Storm
+  "2011-08-28"   # Hurricane Irene
+))
+
+# ── Replace event cnt values with NA then interpolate ──
+day_clean$cnt[day_clean$dteday %in% event_dates]        <- NA
+day_clean$casual[day_clean$dteday %in% event_dates]     <- NA
+day_clean$registered[day_clean$dteday %in% event_dates] <- NA
+
+day_clean$cnt        <- na.approx(day_clean$cnt,        na.rm = FALSE)
+day_clean$casual     <- na.approx(day_clean$casual,     na.rm = FALSE)
+day_clean$registered <- na.approx(day_clean$registered, na.rm = FALSE)
+
+# ── Verify ──
+cat("Original Hurricane Sandy cnt:", 
+    day_data$cnt[day_data$dteday == "2012-10-29"], "\n")
+cat("Cleaned  Hurricane Sandy cnt:", 
+    day_clean$cnt[day_clean$dteday == "2012-10-29"], "\n")
+```
+
+
+
+```{r}
+#Exploratory Data analysis
+
+# Trend & Seasonality (Time Plot with Trend)
+ggplot(day_clean, aes(x = dteday, y = cnt)) +
+  geom_line(color = "grey70") +
+  geom_smooth(method = "loess",formula=y~x, color = "red", 
+              se = TRUE, linewidth = 1.2) +
+  labs(title    = "Daily Bike Demand (2011-2012)",
+       subtitle = "Upward trend + seasonal waves observed",
+       x = "Date", y = "Total Rentals") +
+  theme_minimal()
+```
+
+
+"The time plot reveals a strong upward trend in daily bike rentals from early 2011 through mid 2012, followed by a seasonal decline. Two complete annual seasonal cycles are observed with seasonal amplitude increasing proportionally with the trend level, indicating a multiplicative rather than additive pattern. Significant day-to-day volatility suggests weather and calendar effects drive short-term fluctuations, justifying the inclusion of exogenous variables in SARIMAX and Prophet models."
+
+
+
+```{r}
+#Monthly + Weekly Demand Side by Side
+
+# Monthly
+p1 <- day_clean %>%
+  group_by(mnth) %>%
+  summarise(avg = mean(cnt)) %>%
+  ggplot(aes(x = factor(mnth), y = avg, fill = factor(mnth))) +
+  geom_bar(stat = "identity", show.legend = FALSE) +
+  scale_x_discrete(labels = month.abb) +
+  labs(title = "Monthly Demand Pattern",
+       x = "Month", y = "Avg Rentals") +
+  theme_minimal()
+
+# Weekly
+p2 <- day_clean %>%
+  group_by(weekday) %>%
+  summarise(avg = mean(cnt)) %>%
+  ggplot(aes(x = factor(weekday), y = avg, 
+             fill = factor(weekday))) +
+  geom_bar(stat = "identity", show.legend = FALSE) +
+  scale_x_discrete(labels = c("Sun","Mon","Tue",
+                               "Wed","Thu","Fri","Sat")) +
+  labs(title = "Weekly Demand Pattern",
+       x = "Day", y = "Avg Rentals") +
+  theme_minimal()
+
+grid.arrange(p1, p2, ncol = 2,
+  top = "Supply Allocation: Monthly & Weekly Patterns")
+```
+
+"Monthly analysis reveals strong seasonal demand variation with peak rentals in June–September (~5500–5800) and minimum demand in January–February (~2200), directly informing seasonal supply allocation. Weekly patterns show relatively uniform demand across days, suggesting that day-of-week alone is insufficient for supply decisions — hourly analysis being more critical for operational planning."
+
+
+```{r}
+#Intraday + Weekday vs Weekend Hourly
+
+hour_complete$day_type <- ifelse(
+  hour_complete$weekday %in% c(0,6), "Weekend", "Weekday"
+)
+
+hour_complete %>%
+  group_by(hr, day_type) %>%
+  summarise(avg_cnt = mean(cnt, na.rm = TRUE), 
+            .groups = "drop") %>%
+  ggplot(aes(x = hr, y = avg_cnt, 
+             color = day_type, group = day_type)) +
+  geom_line(linewidth = 1.3) +
+  geom_point(size = 1.8) +
+  scale_x_continuous(breaks = 0:23) +
+  scale_color_manual(values = c("Weekday" = "steelblue",
+                                 "Weekend" = "tomato")) +
+  labs(title    = "Intraday Demand: Weekday vs Weekend",
+       subtitle = "Weekday = commute peaks | Weekend = leisure midday peak",
+       x = "Hour of Day", y = "Average Rentals",
+       color = "") +
+  theme_minimal()
+```
+
+"Intraday analysis reveals fundamentally different demand patterns between weekdays and weekends. Weekdays exhibit a bimodal distribution with sharp peaks at 8AM and 5–6PM corresponding to morning and evening commutes, while weekends show a unimodal leisurely peak between 12–3PM. This distinction directly informs supply redistribution strategies — commuter hubs require stocking before 8AM and 4PM on weekdays, while leisure zones need peak supply around midday on weekends. The 3–4AM window represents the optimal maintenance period across both day types."
+
+
+```{r}
+#Hour x Weekday Heatmap
+hour_complete %>%
+  mutate(day_name = factor(weekday, levels = 0:6,
+                            labels = c("Sun","Mon","Tue",
+                                       "Wed","Thu","Fri","Sat"))) %>%
+  group_by(hr, day_name) %>%
+  summarise(avg_cnt = mean(cnt, na.rm = TRUE), 
+            .groups = "drop") %>%
+  ggplot(aes(x = day_name, y = hr, fill = avg_cnt)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low      = "white",
+                        mid      = "steelblue",
+                        high     = "darkred",
+                        midpoint = 200) +
+  scale_y_continuous(breaks = 0:23) +
+  labs(title    = "Demand Heatmap: Hour × Day of Week",
+       subtitle = "Dark red = critical supply zones for waiting time reduction",
+       x = "Day of Week", y = "Hour",
+       fill = "Avg Rentals") +
+  theme_minimal()
+```
+
+"The hour × weekday demand heatmap precisely identifies critical supply zones for waiting time reduction. The darkest red zones at hours 8 and 17–18 on weekdays represent morning and evening commute peaks exceeding 500 average rentals, confirming these as highest waiting time risk periods. Wednesday and Thursday evenings represent the absolute peak demand moments in the dataset. Weekend demand is uniformly distributed across midday hours without sharp peaks. Early morning hours 0–6 consistently show near-zero demand across all days, representing the optimal window for bike maintenance and station rebalancing operations."
+
+
+
+```{r}
+#Weather Impact (Temp + Weather Situation)
+p1 <- ggplot(day_clean, aes(x = temp * 41, y = cnt)) +
+  geom_point(alpha = 0.3, color = "steelblue") +
+  geom_smooth(method = "loess", color = "red", se = TRUE) +
+  labs(title = "Temperature vs Demand",
+       x = "Temperature (°C)", y = "Rentals") +
+  theme_minimal()
+
+p2 <- ggplot(day_clean, aes(x = factor(weathersit), y = cnt,
+                              fill = factor(weathersit))) +
+  geom_boxplot(show.legend = FALSE) +
+  scale_x_discrete(labels = c("Clear","Misty","Rain/Snow")) +
+  scale_fill_manual(values = c("#59a14f","#f28e2b","#e15759")) +
+  labs(title = "Weather Condition vs Demand",
+       x = "Weather", y = "Rentals") +
+  theme_minimal()
+
+grid.arrange(p1, p2, ncol = 2,
+  top = "Q: Does Weather Drive Demand?")
+```
+
+"Weather conditions significantly influence bike sharing demand. Temperature exhibits a non-linear inverted-U relationship with demand, peaking around 25°C before declining at higher temperatures, necessitating its inclusion as an exogenous variable in SARIMAX and Prophet models. Weather situation analysis reveals that rain and snow conditions reduce median daily demand by approximately 60% compared to clear weather conditions, while misty conditions cause a moderate 15% reduction. These findings strongly justify the use of weather variables as external regressors in advanced forecasting models."
+
+
+```{r}
+#Casual vs Registered User Behavior
+day_clean %>%
+  mutate(day_name = factor(weekday, levels = 0:6,
+                            labels = c("Sun","Mon","Tue",
+                                       "Wed","Thu","Fri","Sat"))) %>%
+  group_by(day_name) %>%
+  summarise(Casual     = mean(casual),
+            Registered = mean(registered)) %>%
+  tidyr::pivot_longer(cols      = c(Casual, Registered),
+                      names_to  = "type",
+                      values_to = "avg") %>%
+  ggplot(aes(x = day_name, y = avg, fill = type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("Casual"     = "tomato",
+                                "Registered" = "steelblue")) +
+  labs(title    = "Casual vs Registered Users by Day",
+       subtitle = "Registered = commuters (weekdays) | Casual = leisure (weekends)",
+       x = "Day", y = "Avg Rentals", fill = "") +
+  theme_minimal()
+```
+
+"Registered users consistently dominate demand across all days of the week, comprising approximately 75–85% of total rentals on weekdays, confirming their role as regular commuters. Casual users exhibit a distinct weekend surge, nearly doubling from weekday levels (~600) to weekend levels (~1400–1500), indicating leisure and tourist ridership. This behavioral divergence necessitates differentiated supply strategies — weekday supply should prioritize commuter corridors and transit hubs, while weekend supply should target recreational and tourist areas to minimize waiting time for both user segments."
+
+
+```{r}
+#demand surge vs surplus over time (gap between actual and 7-day rolling average)
+day_clean$rolling_supply <- rollmean(day_clean$cnt,
+                                      k     = 7,
+                                      fill  = NA,
+                                      align = "right")
+day_clean$supply_gap <- day_clean$cnt - day_clean$rolling_supply
+day_clean %>%
+  filter(!is.na(supply_gap)) %>%
+  ggplot(aes(x = dteday)) +
+  geom_bar(aes(y    = supply_gap,
+               fill = supply_gap > 0),
+           stat = "identity") +
+  scale_fill_manual(
+    values = c("TRUE"  = "darkred",
+               "FALSE" = "steelblue"),
+    labels = c("TRUE"  = "Demand Surge (Waiting Risk)",
+               "FALSE" = "Demand Drop (Surplus)")) +
+  
+  # ✅ Meaningful date breaks
+  scale_x_date(
+    breaks       = seq(as.Date("2011-01-01"),
+                       as.Date("2012-12-31"),
+                       by = "2 months"),
+    date_labels  = "%b\n%Y",        # Jan\n2011 format
+    minor_breaks = "1 month") +
+  
+  # ✅ Meaningful y axis
+  scale_y_continuous(
+    breaks = seq(-5000, 2000, by = 1000),
+    labels = comma) +
+  
+  # ✅ Add reference line at 0
+  geom_hline(yintercept = 0, 
+             color      = "black", 
+             linewidth  = 0.8) +
+  
+  # ✅ Annotate key events
+  annotate("text", x = as.Date("2012-10-29"), y = -4200,
+           label = "Hurricane\nSandy", 
+           color = "black", size = 3, fontface = "bold") +
+  annotate("text", x = as.Date("2011-01-27"), y = -2800,
+           label = "Winter\nStorm",
+           color = "black", size = 3, fontface = "bold") +
+  
+  labs(title    = "Demand Surge vs Surplus Over Time",
+       subtitle = "Red = Waiting Time Risk | Blue = Surplus Opportunity",
+       x        = "Date",
+       y        = "Gap (Actual − 7-Day Rolling Average)",
+       fill     = "") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(hjust = 0.5))
+```
+
+
+Red bars consistently ~+500 to +2000 throughout → persistent waiting time risk
+Blue drops much deeper (-3000 to -4500) → extreme weather creates massive surplus
+Hurricane Sandy (Oct 2012) → deepest blue drop clearly visible ~-4500
+Winter Storm (Jan 2011) → second deepest ~-2800
+Pattern is symmetric — surges and drops alternate regularly throughout both years
+
+
+```{r}
+# Create timeseries  object
+# Create week_data
+week_data <- day_clean %>%
+  mutate(week = format(dteday, "%Y-%U")) %>%
+  group_by(week) %>%
+  summarise(cnt = sum(cnt), .groups = "drop")
+
+# Create month_data 
+month_data <- day_clean %>%
+  group_by(yr, mnth) %>%
+  summarise(cnt = sum(cnt), .groups = "drop")
+ts_daily   <- ts(day_clean$cnt,  frequency = 365, start = c(2011,1))
+ts_weekly  <- ts(week_data$cnt,  frequency = 52,  start = c(2011,1))
+ts_monthly <- ts(month_data$cnt, frequency = 12,  start = c(2011,1))
+
+# Decompose & Plot
+# Daily STL
+stl_daily <- stl(ts_daily, 
+                  s.window = "periodic", 
+                  robust   = TRUE)
+plot(stl_daily, main = "STL — Daily")
+
+# Weekly STL
+stl_weekly <- stl(ts_weekly, 
+                   s.window = "periodic", 
+                   robust   = TRUE)
+plot(stl_weekly, main = "STL — Weekly")
+
+# Monthly Classical only
+# STL fails — only 2 periods (24 months)
+plot(decompose(ts_monthly, type = "multiplicative"))
+```
+
+STL Daily
+Data: Full observed series with high volatility ✅
+Seasonal: Weekly cycles clearly visible, amplitude changes over time → confirms STL was right choice over classical
+Trend: Perfectly smooth linear growth from ~2500 → 6500 ✅
+Remainder: Small random noise throughout, one large spike at end 2012 → Hurricane Sandy residual effect still visible
+
+STL Weekly
+Data: Much smoother than daily ✅
+Seasonal: Annual wave pattern clearly visible
+Trend: Clean linear upward growth ~18000 → 42000 weekly rentals ✅
+Remainder: Mostly flat with few isolated spikes → extreme weather events
+
+Monthly Multiplicative
+Observed: Clear inverted U shape — rises then falls ✅
+Trend: Smooth growth up to mid 2012 then decline
+Seasonal: Ratio fluctuates 0.7 → 1.15 → confirms multiplicative pattern
+Random: Flat line with edge data loss → classical decomposition limitation
+
+
+```{r}
+
+adf_daily   <- adf.test(ts_daily)
+adf_weekly  <- adf.test(ts_weekly)
+adf_monthly <- adf.test(ts_monthly)
+
+cat("Daily   p-value:", round(adf_daily$p.value,   4), "\n")
+cat("Weekly  p-value:", round(adf_weekly$p.value,  4), "\n")
+cat("Monthly p-value:", round(adf_monthly$p.value, 4), "\n")
+
+```
+
+All p-values > 0.05 → All three need differencing before ACF & PACF
+
+
+```{r}
+#Apply First Order Differencing
+# ── First Difference ──
+diff_daily   <- diff(ts_daily,   differences = 1)
+diff_weekly  <- diff(ts_weekly,  differences = 1)
+diff_monthly <- diff(ts_monthly, differences = 1)
+
+# ── Re-test After Differencing ──
+adf_diff_daily   <- adf.test(diff_daily)
+adf_diff_weekly  <- adf.test(diff_weekly)
+adf_diff_monthly <- adf.test(diff_monthly)
+
+cat("After Differencing:\n")
+cat("Daily   p-value:", round(adf_diff_daily$p.value,   4), "\n")
+cat("Weekly  p-value:", round(adf_diff_weekly$p.value,  4), "\n")
+cat("Monthly p-value:", round(adf_diff_monthly$p.value, 4), "\n")
+
+```
+
+weekly and monthly need second differencing, daily is now stationary
+
+```{r}
+# Second difference for weekly & monthly
+diff2_weekly  <- diff(diff_weekly,  differences = 1)
+diff2_monthly <- diff(diff_monthly, differences = 1)
+
+# Re-test
+adf2_weekly  <- adf.test(diff2_weekly)
+adf2_monthly <- adf.test(diff2_monthly)
+
+cat("Weekly  2nd diff p-value:", round(adf2_weekly$p.value,  4), "\n")
+cat("Monthly 2nd diff p-value:", round(adf2_monthly$p.value, 4), "\n")
+```
+
+monthly needs second differencing, weekly is now stationary
+
+```{r}
+# Third difference for monthly
+diff3_monthly <- diff(diff2_monthly, differences = 1)
+
+adf3_monthly <- adf.test(diff3_monthly)
+cat("Monthly 3rd diff p-value:", round(adf3_monthly$p.value, 4), "\n")
+```
+
+"Monthly data with only 24 observations was differenced once (d=1) as further differencing reduced the series to insufficient observations for reliable ADF testing, with the borderline p-value of 0.29 accepted given the small sample size limitation."
+
+
+```{r}
+par(mfrow = c(3,2), mar = c(3, 3, 3, 1))
+acf(diff_daily,    lag.max = 30, main = "ACF — Daily (d=1)")
+pacf(diff_daily,   lag.max = 30, main = "PACF — Daily (d=1)")
+acf(diff2_weekly,  lag.max = 20, main = "ACF — Weekly (d=2)")
+pacf(diff2_weekly, lag.max = 20, main = "PACF — Weekly (d=2)")
+acf(diff_monthly,  lag.max = 12, main = "ACF — Monthly (d=1)")
+pacf(diff_monthly, lag.max = 12, main = "PACF — Monthly (d=1)")
+par(mfrow = c(1,1))
+
+```
+
+
+ACF and PACF analysis on differenced series revealed that daily and monthly series follow an ARIMA(1,1,1) pattern with autocorrelation cutting off after lag 1 in both plots. Weekly series after second differencing suggests an ARIMA(1,2,1) structure. These manually identified orders will be compared against auto.arima selections for final model validation."
+
+
+```{r}
+# TRAIN/TEST SPLIT
+day_clean  <- day_clean[order(day_clean$dteday), ]
+n          <- nrow(day_clean)
+train_data <- day_clean[1:(n-60), ]
+test_data  <- day_clean[(n-59):n, ]
+
+cat("========== Split Summary ==========\n")
+cat("Total days :", n, "\n")
+cat("Train days :", nrow(train_data), "\n")
+cat("Test  days :", nrow(test_data),  "\n")
+cat("Train start:", as.character(min(train_data$dteday)), "\n")
+cat("Train end  :", as.character(max(train_data$dteday)), "\n")
+cat("Test  start:", as.character(min(test_data$dteday)),  "\n")
+cat("Test  end  :", as.character(max(test_data$dteday)),  "\n")
+cat("Overlap    :",
+    length(intersect(train_data$dteday,
+                     test_data$dteday)),
+    "← must be 0\n")
+
+
+#CREATE TS OBJECTS
+# Holt-Winters (classroom)
+ts_train_hw <- ts(train_data$cnt,
+                   frequency = 7,
+                   start     = c(1, 1))
+ts_test_hw  <- ts(test_data$cnt,
+                   frequency = 7,
+                   start     = c(97, 1))
+
+# Main models
+ts_train_msts <- msts(train_data$cnt,
+                       seasonal.periods = c(7, 365),
+                       start            = c(2011, 1))
+ts_test_msts  <- msts(test_data$cnt,
+                       seasonal.periods = c(7, 365),
+                       start            = c(2012, 306))
+
+cat("HW    train:", length(ts_train_hw),   "\n")
+cat("HW    test :", length(ts_test_hw),    "\n")
+cat("MSTS  train:", length(ts_train_msts), "\n")
+cat("MSTS  test :", length(ts_test_msts),  "\n")
+```
+
+
+```{r}
+#CLASSROOM — HOLT-WINTERS
+
+hw_model    <- HoltWinters(ts_train_hw,
+                            seasonal = "multiplicative")
+hw_forecast <- forecast(hw_model, h = 60)
+
+# ── Plot ──
+autoplot(hw_forecast) +
+  autolayer(ts_test_hw,
+            series    = "Actual",
+            color     = "red",
+            linewidth = 0.8) +
+  labs(title    = "Holt-Winters MultiplicativeZ",
+       subtitle = "Weekly seasonality (frequency=7)",
+       x = "Time", y = "Total Rentals") +
+  theme_minimal()
+
+# ── Parameters ──
+cat("=== Smoothing Parameters ===\n")
+cat("Alpha:", round(hw_model$alpha, 4), "\n")
+cat("Beta :", round(hw_model$beta,  4), "\n")
+cat("Gamma:", round(hw_model$gamma, 4), "\n")
+
+# ── Evaluate ──
+hw_pred   <- as.numeric(hw_forecast$mean)
+hw_actual <- as.numeric(ts_test_hw)
+
+hw_mae  <- mean(abs(hw_actual - hw_pred))
+hw_rmse <- sqrt(mean((hw_actual - hw_pred)^2))
+hw_mape <- mean(abs((hw_actual - hw_pred)
+                     / hw_actual)) * 100
+
+cat("\n=== Holt-Winters Results ===\n")
+cat("MAE :", round(hw_mae,  2), "\n")
+cat("RMSE:", round(hw_rmse, 2), "\n")
+cat("MAPE:", round(hw_mape, 2), "%\n")
+
+```
+
+
+
+```{r}
+
+#SEASONAL NAIVE
+
+snaive_model <- snaive(ts_train_msts, h = 60)
+snaive_pred  <- as.numeric(snaive_model$mean)
+actual       <- as.numeric(ts_test_msts)
+
+# ── Plot ──
+autoplot(snaive_model) +
+  autolayer(ts_test_msts,
+            series    = "Actual",
+            color     = "red",
+            linewidth = 0.8) +
+  labs(title    = "Seasonal Naive Forecast",
+       subtitle = "Multi-seasonal benchmark (7 & 365)",
+       x = "Time", y = "Total Rentals") +
+  theme_minimal()
+
+# ── Evaluate ──
+snaive_mae  <- mean(abs(actual - snaive_pred))
+snaive_rmse <- sqrt(mean((actual - snaive_pred)^2))
+snaive_mape <- mean(abs((actual - snaive_pred)
+                         / actual)) * 100
+
+cat("=== Seasonal Naive Results ===\n")
+cat("MAE :", round(snaive_mae,  2), "\n")
+cat("RMSE:", round(snaive_rmse, 2), "\n")
+cat("MAPE:", round(snaive_mape, 2), "%\n")
+```
+
+
+```{r}
+
+#TBATS
+
+tbats_model    <- tbats(ts_train_msts)
+tbats_forecast <- forecast(tbats_model, h = 60)
+tbats_pred     <- as.numeric(tbats_forecast$mean)
+
+# ── Model Summary ──
+cat("TBATS Model:\n")
+print(tbats_model)
+
+# ── Plot ──
+autoplot(tbats_forecast) +
+  autolayer(ts_test_msts,
+            series    = "Actual",
+            color     = "red",
+            linewidth = 0.8) +
+  labs(title    = "TBATS Forecast",
+       subtitle = "Multi-seasonal: weekly + annual",
+       x = "Time", y = "Total Rentals") +
+  theme_minimal()
+
+# ── Evaluate ──
+tbats_mae  <- mean(abs(actual - tbats_pred))
+tbats_rmse <- sqrt(mean((actual - tbats_pred)^2))
+tbats_mape <- mean(abs((actual - tbats_pred)
+                        / actual)) * 100
+
+cat("\n=== TBATS Results ===\n")
+cat("MAE :", round(tbats_mae,  2), "\n")
+cat("RMSE:", round(tbats_rmse, 2), "\n")
+cat("MAPE:", round(tbats_mape, 2), "%\n")
+
+# ── vs Seasonal Naive ──
+cat("\nImprovement over Seasonal Naive:\n")
+cat("MAPE:", round((snaive_mape - tbats_mape)/
+                    snaive_mape * 100, 2), "%\n")
+```
+
+
+```{r}
+# PHASE 9: ARIMA
+arima_model <- auto.arima(ts_train_msts,
+                           seasonal      = TRUE,
+                           stepwise      = FALSE,
+                           approximation = FALSE)
+
+arima_forecast <- forecast(arima_model, h = 60)
+arima_pred     <- as.numeric(arima_forecast$mean)
+
+# ── Model Summary ──
+cat("ARIMA Order Selected:\n")
+print(summary(arima_model))
+
+# ── Plot ──
+autoplot(arima_forecast) +
+  autolayer(ts_test_msts,
+            series    = "Actual",
+            color     = "red",
+            linewidth = 0.8) +
+  labs(title    = "ARIMA Forecast",
+       subtitle = "Auto-selected optimal order",
+       x = "Time", y = "Total Rentals") +
+  theme_minimal()
+
+# ── Evaluate ──
+arima_mae  <- mean(abs(actual - arima_pred))
+arima_rmse <- sqrt(mean((actual - arima_pred)^2))
+arima_mape <- mean(abs((actual - arima_pred)
+                        / actual)) * 100
+
+cat("\n=== ARIMA Results ===\n")
+cat("MAE :", round(arima_mae,  2), "\n")
+cat("RMSE:", round(arima_rmse, 2), "\n")
+cat("MAPE:", round(arima_mape, 2), "%\n")
+
+cat("\nImprovement over Seasonal Naive:\n")
+cat("MAPE:", round((snaive_mape - arima_mape)/
+                    snaive_mape * 100, 2), "%\n")
+```
+
+
+```{r}
+#PROPHET
+
+library(prophet)
+
+# ── Prepare data ──
+prophet_train <- data.frame(
+  ds          = train_data$dteday,
+  y           = train_data$cnt,
+  temp        = train_data$temp,
+  hum         = train_data$hum,
+  windspeed   = train_data$windspeed,
+  weathersit  = train_data$weathersit
+)
+
+prophet_test <- data.frame(
+  ds          = test_data$dteday,
+  y           = test_data$cnt,
+  temp        = test_data$temp,
+  hum         = test_data$hum,
+  windspeed   = test_data$windspeed,
+  weathersit  = test_data$weathersit
+)
+
+# ── Build model ──
+prophet_model <- prophet(
+  seasonality.mode        = "multiplicative",
+  changepoint.prior.scale = 0.05,
+  yearly.seasonality      = TRUE,
+  weekly.seasonality      = TRUE,
+  daily.seasonality       = FALSE
+)
+
+# ── Add regressors ──
+prophet_model <- add_regressor(prophet_model, "temp")
+prophet_model <- add_regressor(prophet_model, "hum")
+prophet_model <- add_regressor(prophet_model, "windspeed")
+prophet_model <- add_regressor(prophet_model, "weathersit")
+
+# ── Add US holidays ──
+prophet_model <- add_country_holidays(prophet_model,
+                                       country_name = "US")
+
+# ── Fit ──
+prophet_model <- fit.prophet(prophet_model,
+                              prophet_train)
+
+# ── Forecast ──
+prophet_fc   <- predict(prophet_model, prophet_test)
+prophet_pred <- prophet_fc$yhat
+
+# ── Plot forecast ──
+plot(prophet_model, prophet_fc) +
+  labs(title = "Prophet Forecast — Multi-Seasonal + Weather + Holidays",
+       x = "Date", y = "Total Rentals") +
+  theme_minimal()
+
+# ── Component plot ──
+prophet_plot_components(prophet_model, prophet_fc)
+
+# ── Evaluate ──
+prophet_actual <- test_data$cnt
+prophet_mae    <- mean(abs(prophet_actual - prophet_pred))
+prophet_rmse   <- sqrt(mean((prophet_actual - prophet_pred)^2))
+prophet_mape   <- mean(abs((prophet_actual - prophet_pred)
+                            / prophet_actual)) * 100
+
+cat("=== Prophet Results ===\n")
+cat("MAE :", round(prophet_mae,  2), "\n")
+cat("RMSE:", round(prophet_rmse, 2), "\n")
+cat("MAPE:", round(prophet_mape, 2), "%\n")
+
+cat("\nImprovement over Seasonal Naive:\n")
+cat("MAPE:", round((snaive_mape - prophet_mape)/
+                    snaive_mape * 100, 2), "%\n")
+```
+
+
+Prophet MAPE = 25.63%
+Beats ALL baseline models
+
+
+
+```{r}
+# PHASE 11: XGBOOST
+
+library(xgboost)
+
+# ── Feature Engineering ──
+create_features <- function(df) {
+  df$month     <- as.numeric(format(df$dteday, "%m"))
+  df$weekday_n <- as.numeric(df$weekday)
+  df$lag1      <- dplyr::lag(df$cnt, 1)
+  df$lag7      <- dplyr::lag(df$cnt, 7)
+  df$lag30     <- dplyr::lag(df$cnt, 30)
+  df$roll7     <- zoo::rollmean(df$cnt, 7,
+                                 fill  = NA,
+                                 align = "right")
+  return(df)
+}
+
+# ── Apply to full data first ──
+day_feat <- create_features(day_clean)
+day_feat <- day_feat[!is.na(day_feat$lag30), ]
+
+n_feat     <- nrow(day_feat)
+train_feat <- day_feat[1:(n_feat-60), ]
+test_feat  <- day_feat[(n_feat-59):n_feat, ]
+
+# ── Features & Target ──
+features <- c("temp","hum","windspeed",
+               "weathersit","season",
+               "month","weekday_n",
+               "holiday","workingday",
+               "lag1","lag7","lag30","roll7")
+
+X_train <- as.matrix(train_feat[, features])
+y_train <- train_feat$cnt
+X_test  <- as.matrix(test_feat[, features])
+y_test  <- test_feat$cnt
+
+# ── DMatrix ──
+dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+dtest  <- xgb.DMatrix(data = X_test,  label = y_test)
+
+# ── Parameters ──
+xgb_params <- list(
+  max_depth        = 4,
+  eta              = 0.05,
+  subsample        = 0.8,
+  colsample_bytree = 0.8,
+  min_child_weight = 5,
+  gamma            = 0.1,
+  lambda           = 1.0,
+  objective        = "reg:squarederror"
+)
+
+# ── Cross Validation ──
+xgb_cv <- xgb.cv(
+  params                = xgb_params,
+  data                  = dtrain,
+  nrounds               = 500,
+  nfold                 = 5,
+  early_stopping_rounds = 20,
+  verbose               = FALSE
+)
+best_rounds <- xgb_cv$best_iteration
+if (length(best_rounds) == 0) {
+  best_rounds <- 100  # Default fallback if CV fails
+  message("Warning: CV did not return best_iteration. Using default of 100.")
+}
+
+cat("Best rounds:", best_rounds, "\n")
+
+# ── Train ──
+xgb_model <- xgb.train(
+  params  = xgb_params,
+  data    = dtrain,
+  nrounds = best_rounds
+)
+
+# ── Predict ──
+xgb_pred <- predict(xgb_model, dtest)
+
+# ── Feature Importance ──
+importance <- xgb.importance(feature_names = features,
+                              model         = xgb_model)
+xgb.plot.importance(importance,
+                     main = "XGBoost Feature Importance")
+
+# ── Overfitting Check ──
+train_pred_xgb <- predict(xgb_model, dtrain)
+cat("\nOverfitting Check:\n")
+cat("Train RMSE:", round(sqrt(mean(
+  (y_train - train_pred_xgb)^2)), 2), "\n")
+cat("Test  RMSE:", round(sqrt(mean(
+  (y_test  - xgb_pred)^2)), 2), "\n")
+
+# ── Evaluate ──
+xgb_mae  <- mean(abs(y_test - xgb_pred))
+xgb_rmse <- sqrt(mean((y_test - xgb_pred)^2))
+xgb_mape <- mean(abs((y_test - xgb_pred)
+                       / y_test)) * 100
+
+cat("\n=== XGBoost Results ===\n")
+cat("MAE :", round(xgb_mae,  2), "\n")
+cat("RMSE:", round(xgb_rmse, 2), "\n")
+cat("MAPE:", round(xgb_mape, 2), "%\n")
+
+cat("\nImprovement over Prophet:\n")
+cat("MAPE:", round((prophet_mape - xgb_mape)/
+                    prophet_mape * 100, 2), "%\n")
+```
+
+```{r}
+
+#Model comparision
+# ── Actual vs Predicted — All Models ──
+comparison_df <- data.frame(
+  Date           = test_data$dteday,
+  Actual         = as.numeric(ts_test_msts),
+  Seasonal_Naive = snaive_pred,
+  TBATS          = tbats_pred,
+  ARIMA          = arima_pred,
+  Prophet        = prophet_pred,
+  XGBoost        = xgb_pred
+)
+
+comparison_long <- comparison_df %>%
+  pivot_longer(cols      = -Date,
+               names_to  = "Model",
+               values_to = "Value")
+
+ggplot(comparison_long,
+       aes(x     = Date,
+           y     = Value,
+           color = Model,
+           group = Model)) +
+  geom_line(linewidth = 0.9) +
+  scale_color_manual(
+    values = c("Actual"         = "black",
+               "Seasonal_Naive" = "grey50",
+               "TBATS"          = "orange",
+               "ARIMA"          = "purple",
+               "Prophet"        = "steelblue",
+               "XGBoost"        = "darkred")) +
+  scale_x_date(
+    date_breaks  = "2 weeks",
+    date_labels  = "%b %d") +
+  labs(title    = "Actual vs Predicted — All Models",
+       subtitle = "Test Period: Nov–Dec 2012 | Closer to Black = Better",
+       x        = "Date",
+       y        = "Total Rentals",
+       color    = "Model") +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        axis.text.x     = element_text(angle = 45,
+                                        hjust = 1))
+```
+
+
+```{r}
+# ── Final Metrics Table ──
+results <- data.frame(
+  Model = c("Holt-Winters",
+            "Seasonal Naive",
+            "TBATS",
+            "ARIMA",
+            "Prophet",
+            "XGBoost"),
+  Track = c("Classroom",
+            "Main",
+            "Main",
+            "Main",
+            "Main",
+            "Main"),
+  MAE   = round(c(hw_mae,
+                   snaive_mae,
+                   tbats_mae,
+                   arima_mae,
+                   prophet_mae,
+                   xgb_mae), 2),
+  RMSE  = round(c(hw_rmse,
+                   snaive_rmse,
+                   tbats_rmse,
+                   arima_rmse,
+                   prophet_rmse,
+                   xgb_rmse), 2),
+  MAPE  = paste0(round(c(hw_mape,
+                          snaive_mape,
+                          tbats_mape,
+                          arima_mape,
+                          prophet_mape,
+                          xgb_mape), 2), "%")
+)
+
+# ── Order by RMSE ──
+results <- results[order(results$RMSE), ]
+
+# ── Print Table ──
+cat("╔══════════════════════════════════════════════════╗\n")
+cat("║           MODEL COMPARISON TABLE                ║\n")
+cat("╠══════════════════════════════════════════════════╣\n")
+cat(sprintf("%-18s %-10s %-10s %-10s %-10s\n",
+            "Model", "Track", "MAE", "RMSE", "MAPE"))
+cat("╠══════════════════════════════════════════════════╣\n")
+for(i in 1:nrow(results)) {
+  cat(sprintf("%-18s %-10s %-10s %-10s %-10s\n",
+              results$Model[i],
+              results$Track[i],
+              results$MAE[i],
+              results$RMSE[i],
+              results$MAPE[i]))
+}
+cat("╠══════════════════════════════════════════════════╣\n")
+cat(sprintf("Best Model → %s (RMSE: %s | MAPE: %s)\n",
+            results$Model[1],
+            results$RMSE[1],
+            results$MAPE[1]))
+cat("╚══════════════════════════════════════════════════╝\n")
+```
+
+
+
+```{r}
+# ════════════════════════════════════
+# PHASE 13: SUPPLY OPTIMIZATION
+# ════════════════════════════════════
+
+# ── Next 30 days forecast ──
+future_dates <- data.frame(
+  ds         = seq(as.Date("2013-01-01"), by="day", length.out=30),
+  temp       = mean(train_data$temp),
+  hum        = mean(train_data$hum),
+  windspeed  = mean(train_data$windspeed),
+  weathersit = 1
+)
+
+future_fc <- predict(prophet_model, future_dates)
+
+# ── Build supply plan ──
+supply_plan <- data.frame(
+  Date     = future_dates$ds,
+  Demand   = pmax(0, round(future_fc$yhat)),
+  Lower    = pmax(0, round(future_fc$yhat_lower)),
+  Upper    = pmax(0, round(future_fc$yhat_upper)),
+  Supply   = pmax(0, round(future_fc$yhat * 1.15)),
+  Risk     = ifelse(future_fc$yhat > quantile(future_fc$yhat, 0.75), "High",
+             ifelse(future_fc$yhat > quantile(future_fc$yhat, 0.50), "Medium", "Low"))
+)
+
+# ── Print ──
+cat("===== Daily Supply Plan — Jan 2013 =====\n")
+print(supply_plan[, c("Date","Demand","Supply","Risk")], 
+      row.names = FALSE)
+
+cat("\n===== Monthly Summary =====\n")
+cat("Total Demand :", sum(supply_plan$Demand),  "\n")
+cat("Total Supply :", sum(supply_plan$Supply),  "\n")
+cat("Buffer       :", sum(supply_plan$Supply) - 
+                      sum(supply_plan$Demand),  "\n")
+cat("Peak Day     :", max(supply_plan$Demand),  "\n")
+cat("Lowest Day   :", min(supply_plan$Demand),  "\n")
+cat("Avg Daily    :", round(mean(supply_plan$Demand)), "\n")
+
+# ── Plot ──
+ggplot(supply_plan, aes(x = Date)) +
+  geom_ribbon(aes(ymin = Lower, ymax = Upper),
+              fill = "steelblue", alpha = 0.2) +
+  geom_line(aes(y = Demand, color = "Forecast"),
+            linewidth = 1.2) +
+  geom_line(aes(y = Supply, color = "Recommended Supply"),
+            linewidth = 1.2, linetype = "dashed") +
+  scale_color_manual(
+    values = c("Forecast"            = "steelblue",
+               "Recommended Supply"  = "darkred")) +
+  scale_x_date(date_breaks = "1 week",
+               date_labels = "%b %d") +
+  labs(title    = "30-Day Bike Supply Plan — January 2013",
+       subtitle = "Shaded = Uncertainty | Dashed = Recommended Supply (15% buffer)",
+       x = "Date", y = "Bikes", color = "") +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        axis.text.x     = element_text(angle = 45, hjust = 1))
+```
+
+
+```{r}
+#RESIDUAL ANALYSIS
+# ── Calculate residuals ──
+residuals_prophet <- as.numeric(ts_test_msts) - prophet_pred
+residuals_xgb     <- y_test - xgb_pred
+
+par(mfrow = c(2,2))
+
+# ── Prophet Residuals ──
+plot(residuals_prophet, type = "l",
+     main = "Prophet Residuals",
+     col  = "steelblue",
+     ylab = "Error", xlab = "Day")
+abline(h = 0, col = "red", lwd = 1.5)
+
+hist(residuals_prophet, breaks = 20,
+     main = "Prophet Residual Distribution",
+     col  = "steelblue", xlab = "Error")
+
+# ── XGBoost Residuals ──
+plot(residuals_xgb, type = "l",
+     main = "XGBoost Residuals",
+     col  = "darkred",
+     ylab = "Error", xlab = "Day")
+abline(h = 0, col = "red", lwd = 1.5)
+
+hist(residuals_xgb, breaks = 20,
+     main = "XGBoost Residual Distribution",
+     col  = "darkred", xlab = "Error")
+
+par(mfrow = c(1,1))
+```
+
+
+"Residual analysis confirms both Prophet and XGBoost produce errors centered near zero with no systematic bias. XGBoost residuals show a more symmetric distribution and random pattern, indicating better model fit. Both models exhibit a common large negative error around day 20 of the test period corresponding to pre-Thanksgiving demand surge in late November 2012, suggesting holiday transition effects are slightly underestimated. Overall residual patterns validate both models as reliable forecasting tools for bike sharing supply optimization."
